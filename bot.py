@@ -6,6 +6,7 @@ import re
 import time
 import base64
 import logging
+import json
 
 from PIL import Image
 from dotenv import load_dotenv
@@ -50,11 +51,9 @@ def should_reply(update: Update) -> bool:
     msg = update.message
     if msg.chat.type == ChatType.PRIVATE:
         return True
-    # replied to one of our messages
     if msg.reply_to_message and msg.reply_to_message.from_user:
         if msg.reply_to_message.from_user.id == int(BOT_TOKEN.split(":")[0]):
             return True
-    # @mentioned
     text = msg.text or msg.caption or ""
     if _bot_username and f"@{_bot_username}" in text:
         return True
@@ -68,59 +67,39 @@ def strip_mention(text: str) -> str:
 
 
 def escape_md(text: str) -> str:
-    """Try to convert LLM markdown to Telegram MarkdownV2.
-    Falls back gracefully — caller should catch parse errors."""
-    # Telegram MarkdownV2 requires escaping these outside of entities
-    # This is a best-effort converter, not perfect
     out = text
-
-    # protect code blocks first
     blocks = []
     def save_block(m):
         blocks.append(m.group(0))
         return f"\x00BLOCK{len(blocks)-1}\x00"
     out = re.sub(r"```[\s\S]*?```", save_block, out)
-
-    # protect inline code
     inlines = []
     def save_inline(m):
         inlines.append(m.group(0))
         return f"\x00INLINE{len(inlines)-1}\x00"
     out = re.sub(r"`[^`]+`", save_inline, out)
-
-    # escape special chars (outside code)
     for ch in r"\_*[]()~>#+-=|{}.!":
         out = out.replace(ch, f"\\{ch}")
-
-    # restore bold **text** → *text*
     out = re.sub(r"\\\*\\\*(.*?)\\\*\\\*", r"*\1*", out)
-    # restore italic _text_ (single)
     out = re.sub(r"\\_([^\\_]+)\\_", r"_\1_", out)
-
-    # restore code blocks and inline code
     for i, block in enumerate(blocks):
         out = out.replace(f"\x00BLOCK{i}\x00", block)
     for i, inline in enumerate(inlines):
         out = out.replace(f"\x00INLINE{i}\x00", inline)
-
     return out
 
 
 async def send_long(msg, text):
-    """Send potentially long text, splitting into multiple messages if needed."""
     chunks = []
     while text:
         if len(text) <= 4096:
             chunks.append(text)
             break
-        # split at last newline before 4096
         cut = text[:4096].rfind("\n")
         if cut < 100:
             cut = 4096
         chunks.append(text[:cut])
         text = text[cut:].lstrip("\n")
-
-    # first chunk: edit the placeholder
     first = chunks[0]
     try:
         await msg.edit_text(first, parse_mode=ParseMode.MARKDOWN_V2)
@@ -129,8 +108,6 @@ async def send_long(msg, text):
             await msg.edit_text(first)
         except Exception:
             pass
-
-    # remaining chunks: new messages
     for chunk in chunks[1:]:
         try:
             await msg.reply_text(chunk, parse_mode=ParseMode.MARKDOWN_V2)
@@ -138,10 +115,64 @@ async def send_long(msg, text):
             await msg.reply_text(chunk)
 
 
+async def generate_image(prompt: str) -> str:
+    """Call /images/generations endpoint."""
+    gen_url = f"{BASE_URL}/images/generations"
+    payload = {
+        "model": MODEL,
+        "prompt": prompt,
+        "n": 1
+    }
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json"
+    }
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=60.0) as http:
+            resp = await http.post(gen_url, json=payload, headers=headers)
+            data = resp.json()
+        if resp.status_code != 200:
+            return f"Image generation error: {data.get('error', {}).get('message', resp.text)}"
+        if "data" in data and len(data["data"]) > 0:
+            return data["data"][0].get("url") or data["data"][0].get("b64_json") or str(data["data"][0])
+        elif "url" in data:
+            return data["url"]
+        elif "output" in data:
+            return data["output"][0] if isinstance(data["output"], list) else str(data["output"])
+        else:
+            return f"Image generated, but unexpected response format: {json.dumps(data)[:200]}"
+    except Exception as e:
+        return f"Image generation failed: {str(e)}"
+
+
 async def stream_reply(msg, messages, model):
     full = ""
     last_len = 0
     last_t = time.time()
+
+    user_content = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            user_content = m.get("content", "")
+            break
+
+    if any(kw in user_content for kw in ["画", "生成", "图片", "照片", "图", "绘", "create", "generate", "draw", "image", "picture"]):
+        prompt = user_content
+        for prefix in ["画", "生成", "图片", "照片", "图", "绘", "create", "generate", "draw", "image", "picture"]:
+            prompt = prompt.replace(prefix, "").strip()
+        if not prompt:
+            prompt = user_content
+        result = await generate_image(prompt)
+        if result.startswith("http") or result.startswith("data:image"):
+            try:
+                await msg.reply_photo(result)
+                await msg.edit_text("🖼️ Image generated!")
+            except Exception:
+                await msg.edit_text(f"Generated image: {result}")
+        else:
+            await msg.edit_text(result)
+        return "image_generated"
 
     try:
         stream = await client.chat.completions.create(
@@ -183,8 +214,6 @@ async def stream_reply(msg, messages, model):
     return full
 
 
-# --- commands ---
-
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Send me a message and I'll reply using AI.\n"
@@ -214,8 +243,6 @@ async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Context cleared — I won't remember previous messages.")
 
 
-# --- message handlers ---
-
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not allowed(uid) or not should_reply(update):
@@ -236,7 +263,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     placeholder = await update.message.reply_text("...")
     reply = await stream_reply(placeholder, msgs, model)
-    if reply:
+    if reply and reply != "image_generated":
         hist.append({"role": "assistant", "content": reply})
 
 
@@ -279,7 +306,7 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     placeholder = await update.message.reply_text("...")
     reply = await stream_reply(placeholder, msgs, model)
-    if reply:
+    if reply and reply != "image_generated":
         hist.append({"role": "user", "content": f"[photo] {caption}"})
         hist.append({"role": "assistant", "content": reply})
 
@@ -303,7 +330,6 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         text = transcript.text.strip()
     except Exception as e:
-        # whisper not available on this provider
         log.warning("transcription failed: %s", e)
         await update.message.reply_text(
             "Voice transcription isn't supported by your current API provider.\n"
@@ -326,7 +352,7 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     placeholder = await update.message.reply_text(f"\U0001f3a4 \"{text}\"\n\n...")
     reply = await stream_reply(placeholder, msgs, model)
-    if reply:
+    if reply and reply != "image_generated":
         hist.append({"role": "assistant", "content": reply})
 
 
