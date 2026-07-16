@@ -85,14 +85,31 @@ def strip_mention(text: str) -> str:
 def detect_model_from_text(text: str) -> tuple:
     """
     检测文本中的指令前缀，返回 (模型ID, 去除前缀后的文本)
-    示例：
-        "NB 画一只猫" -> ("gpt-image-2", "画一只猫")
-        "ZZ 你好" -> ("claude-sonnet-5", "你好")
-        "你好" -> (None, "你好")
     """
     text = text.strip()
     if not text:
         return None, text
+
+    # 先检查完整匹配（前缀+分隔符）
+    for prefix, model_id in MODEL_MAP.items():
+        # 匹配 "NB " 或 "NB:" 或 "NB：" 等（不区分大小写）
+        # 使用 re.IGNORECASE 标志，而不是内联 (?i)
+        pattern = rf"^{re.escape(prefix)}[\s:：\n]+"
+        match = re.match(pattern, text, re.IGNORECASE)
+        if match:
+            clean_text = text[match.end():].strip()
+            return model_id, clean_text
+
+    # 再检查无分隔符的情况（如 "NB画一只猫"）
+    for prefix, model_id in MODEL_MAP.items():
+        if text.lower().startswith(prefix.lower()):
+            # 确保前缀后面不是字母（避免误匹配）
+            remaining = text[len(prefix):]
+            if not remaining or not remaining[0].isalpha():
+                clean_text = remaining.strip()
+                return model_id, clean_text
+
+    return None, text
 
     # 检查是否以指令前缀开头（不区分大小写）
     for prefix, model_id in MODEL_MAP.items():
