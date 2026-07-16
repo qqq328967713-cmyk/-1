@@ -259,18 +259,18 @@ async def stream_reply(msg, messages, model):
     last_len = 0
     last_t = time.time()
 
-   user_content = ""
-for m in reversed(messages):
-    if m.get("role") == "user":
-        raw = m.get("content", "")
-        if isinstance(raw, list):
-            for item in raw:
-                if item.get("type") == "text":
-                    user_content = item.get("text", "")
-                    break
-        else:
-            user_content = raw
-        break
+    user_content = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            raw = m.get("content", "")
+            if isinstance(raw, list):
+                for item in raw:
+                    if item.get("type") == "text":
+                        user_content = item.get("text", "")
+                        break
+            else:
+                user_content = raw
+            break
 
     model_type = get_model_type(model)
 
