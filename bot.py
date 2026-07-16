@@ -26,27 +26,23 @@ BASE_URL = os.getenv("BASE_URL", "https://api.tokenmix.ai/v1")
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))
 ALLOWED_USERS = os.getenv("ALLOWED_USERS", "")
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "You are a helpful assistant.")
-
-# ============================================
-# 多模型配置（通过指令前缀切换）
-# ============================================
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-4o-mini")
 
-# 模型映射表：指令前缀 -> 模型ID
+# ============================================
+# 多模型配置
+# ============================================
 MODEL_MAP = {
-    "NB": "gpt-image-2",          # 图片生成
-    "A": "gemini-3.1-pro-preview", # Gemini Pro
-    "ZZ": "claude-sonnet-5",       # Claude Sonnet
-    "SP": "kling-3.0-turbo",       # Kling
+    "NB": {"id": "gpt-image-2", "type": "image"},
+    "A": {"id": "gemini-3.1-pro-preview", "type": "chat"},
+    "ZZ": {"id": "claude-sonnet-5", "type": "chat"},
+    "SP": {"id": "kling-3.0-turbo", "type": "video"},
 }
-# 可用模型列表（用于展示）
-AVAILABLE_MODELS = list(MODEL_MAP.values()) + [DEFAULT_MODEL]
 
 log = logging.getLogger(__name__)
 client = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL)
 
 histories = {}
-user_models = {}  # 记录用户最后使用的模型
+user_models = {}
 _bot_username = None
 
 
@@ -91,9 +87,8 @@ def detect_model_from_text(text: str) -> tuple:
         return None, text
 
     # 先检查完整匹配（前缀+分隔符）
-    for prefix, model_id in MODEL_MAP.items():
-        # 匹配 "NB " 或 "NB:" 或 "NB：" 等（不区分大小写）
-        # 使用 re.IGNORECASE 标志，而不是内联 (?i)
+    for prefix, info in MODEL_MAP.items():
+        model_id = info["id"]
         pattern = rf"^{re.escape(prefix)}[\s:：\n]+"
         match = re.match(pattern, text, re.IGNORECASE)
         if match:
@@ -101,32 +96,12 @@ def detect_model_from_text(text: str) -> tuple:
             return model_id, clean_text
 
     # 再检查无分隔符的情况（如 "NB画一只猫"）
-    for prefix, model_id in MODEL_MAP.items():
+    for prefix, info in MODEL_MAP.items():
+        model_id = info["id"]
         if text.lower().startswith(prefix.lower()):
-            # 确保前缀后面不是字母（避免误匹配）
             remaining = text[len(prefix):]
             if not remaining or not remaining[0].isalpha():
                 clean_text = remaining.strip()
-                return model_id, clean_text
-
-    return None, text
-
-    # 检查是否以指令前缀开头（不区分大小写）
-    for prefix, model_id in MODEL_MAP.items():
-        # 匹配 "NB " 或 "NB:" 或 "NB\n" 等
-        pattern = rf"^(?i){prefix}[\s:：\n]+"
-        match = re.match(pattern, text)
-        if match:
-            clean_text = text[match.end():].strip()
-            return model_id, clean_text
-
-    # 也支持 "NB" 后无空格的情况（如 "NB画一只猫"）
-    for prefix, model_id in MODEL_MAP.items():
-        if text.upper().startswith(prefix.upper()):
-            # 检查前缀后面的字符是否是非字母
-            next_char = text[len(prefix):].strip()[:1] if len(text) > len(prefix) else ""
-            if not next_char or not next_char.isalpha():
-                clean_text = text[len(prefix):].strip()
                 return model_id, clean_text
 
     return None, text
@@ -182,10 +157,10 @@ async def send_long(msg, text):
 
 
 async def generate_image(prompt: str) -> str:
-    """调用 /images/generations 接口"""
+    """调用 /images/generations 接口生成图片"""
     gen_url = f"{BASE_URL}/images/generations"
     payload = {
-        "model": "gpt-image-2",  # 固定用图片模型
+        "model": "gpt-image-2",
         "prompt": prompt,
         "n": 1
     }
@@ -199,7 +174,6 @@ async def generate_image(prompt: str) -> str:
             data = resp.json()
         if resp.status_code != 200:
             return f"Image generation error: {data.get('error', {}).get('message', resp.text)}"
-
         if "data" in data and len(data["data"]) > 0:
             item = data["data"][0]
             if "url" in item and item["url"]:
@@ -217,7 +191,41 @@ async def generate_image(prompt: str) -> str:
         return f"Image generation failed: {str(e)}"
 
 
+async def generate_video(prompt: str) -> str:
+    """调用 /videos/generations 接口生成视频"""
+    gen_url = f"{BASE_URL}/videos/generations"
+    payload = {
+        "model": "kling-3.0-turbo",
+        "prompt": prompt,
+        "duration": 3
+    }
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json"
+    }
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as http:
+            resp = await http.post(gen_url, json=payload, headers=headers)
+            data = resp.json()
+        if resp.status_code != 200:
+            return f"Video generation error: {data.get('error', {}).get('message', resp.text)}"
+        if "data" in data and len(data["data"]) > 0:
+            item = data["data"][0]
+            if "url" in item and item["url"]:
+                return item["url"]
+            if "video_url" in item:
+                return item["video_url"]
+        if "url" in data:
+            return data["url"]
+        if "video_url" in data:
+            return data["video_url"]
+        return f"Unexpected response: {json.dumps(data)[:200]}"
+    except Exception as e:
+        return f"Video generation failed: {str(e)}"
+
+
 async def send_image_result(msg, result: str, original_prompt: str = ""):
+    """发送图片结果"""
     if result.startswith("http") or result.startswith("data:image"):
         try:
             await msg.reply_photo(result, caption=original_prompt[:200] if original_prompt else None)
@@ -238,6 +246,14 @@ async def send_image_result(msg, result: str, original_prompt: str = ""):
     return False
 
 
+def get_model_type(model_id: str) -> str:
+    """根据模型ID获取类型"""
+    for prefix, info in MODEL_MAP.items():
+        if info["id"] == model_id:
+            return info["type"]
+    return "chat"
+
+
 async def stream_reply(msg, messages, model):
     full = ""
     last_len = 0
@@ -249,12 +265,30 @@ async def stream_reply(msg, messages, model):
             user_content = m.get("content", "")
             break
 
-    # 判断是否为生图请求（NB 前缀已确保使用图片模型，这里额外检测关键词）
-    is_image_request = model == "gpt-image-2" or any(kw in user_content for kw in ["画", "生成", "图片", "照片", "图", "绘"])
+    model_type = get_model_type(model)
 
-    if is_image_request and model == "gpt-image-2":
+    # ===== 视频生成 =====
+    if model_type == "video":
         prompt = user_content
-        for prefix in ["画", "生成", "图片", "照片", "图", "绘", "create", "generate", "draw", "image", "picture"]:
+        for prefix in ["视频", "生成", "拍", "录"]:
+            prompt = prompt.replace(prefix, "").strip()
+        if not prompt:
+            prompt = user_content
+        result = await generate_video(prompt)
+        if result.startswith("http"):
+            try:
+                await msg.reply_video(result, caption=prompt[:200] if prompt else None)
+                await msg.edit_text("🎬 视频已生成！")
+            except Exception:
+                await msg.edit_text(f"生成的视频：{result}")
+        else:
+            await msg.edit_text(f"❌ {result}")
+        return "video_generated"
+
+    # ===== 图片生成 =====
+    if model_type == "image":
+        prompt = user_content
+        for prefix in ["画", "生成", "图片", "照片", "图", "绘"]:
             prompt = prompt.replace(prefix, "").strip()
         if not prompt:
             prompt = user_content
@@ -262,7 +296,7 @@ async def stream_reply(msg, messages, model):
         await send_image_result(msg, result, prompt)
         return "image_generated"
 
-    # 普通聊天流
+    # ===== 文本聊天 =====
     try:
         stream = await client.chat.completions.create(
             model=model, messages=messages, stream=True,
@@ -270,7 +304,6 @@ async def stream_reply(msg, messages, model):
         async for chunk in stream:
             if chunk.choices and chunk.choices[0].delta.content:
                 full += chunk.choices[0].delta.content
-
             now = time.time()
             if full and (now - last_t > 1.2 or len(full) - last_len > 120):
                 try:
@@ -280,11 +313,10 @@ async def stream_reply(msg, messages, model):
                     pass
                 last_t = now
                 last_len = len(full)
-
     except Exception as e:
         err = str(e)
-        if "401" in err or "403" in err or "Incorrect API key" in err:
-            await msg.edit_text("Error: Authentication failed — check API_KEY in .env")
+        if "401" in err or "403" in err:
+            await msg.edit_text("Error: Authentication failed — check API_KEY")
         elif "429" in err:
             await msg.edit_text("Rate limited — wait a moment and try again.")
         else:
@@ -304,28 +336,15 @@ async def stream_reply(msg, messages, model):
 # 命令处理器
 # ============================================
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    model_list = "\n".join([f"  • `{prefix}` → {model}" for prefix, model in MODEL_MAP.items()])
-    await update.message.reply_text(
-        f"🤖 **多模型 Bot**\n\n"
-        f"在消息前加前缀即可切换模型：\n{model_list}\n\n"
-        f"示例：\n"
-        f"`NB 画一只猫` → 用 {MODEL_MAP['NB']} 生成图片\n"
-        f"`A 解释一下量子计算` → 用 {MODEL_MAP['A']} 回答\n"
-        f"`ZZ 写一段代码` → 用 {MODEL_MAP['ZZ']} 编程\n\n"
-        f"不加前缀则使用默认模型：`{DEFAULT_MODEL}`\n\n"
-        f"📷 发送图片+文字 → 图片分析\n"
-        f"🎤 发送语音 → 语音转录\n"
-        f"👥 群聊中 @我 或回复我的消息",
-        parse_mode=ParseMode.MARKDOWN_V2
-    )
-
-
-async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """查看当前可用模型"""
-    lines = ["**可用模型前缀：**"]
-    for prefix, model in MODEL_MAP.items():
-        lines.append(f"  • `{prefix}` → {model}")
+    lines = ["**可用模型：**"]
+    for prefix, info in MODEL_MAP.items():
+        emoji = "🖼️" if info["type"] == "image" else "🎬" if info["type"] == "video" else "💬"
+        lines.append(f"  • `{prefix}` → {emoji} {info['id']}")
     lines.append(f"  • (无前缀) → {DEFAULT_MODEL}")
+    lines.append("\n示例：")
+    lines.append("  `NB 画一只猫` → 生成图片")
+    lines.append("  `SP 生成3秒视频` → 生成视频")
+    lines.append("  `A 解释量子计算` → AI 回答")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
 
 
@@ -346,20 +365,16 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not raw_text:
         return
 
-    # 检测模型前缀
     selected_model, clean_text = detect_model_from_text(raw_text)
     if selected_model is None:
         selected_model = DEFAULT_MODEL
 
-    # 记录用户最后使用的模型
     user_models[uid] = selected_model
 
-    # 如果用户用了 "NB" 前缀但没给 prompt，提示一下
-    if selected_model == "gpt-image-2" and not clean_text:
-        await update.message.reply_text("请告诉我你想画什么，比如：`NB 一只猫`", parse_mode=ParseMode.MARKDOWN_V2)
+    if not clean_text:
+        await update.message.reply_text("请告诉我你想做什么，比如：`NB 画一只猫`", parse_mode=ParseMode.MARKDOWN_V2)
         return
 
-    # 保存历史
     hist = get_hist(uid)
     hist.append({"role": "user", "content": clean_text})
 
@@ -370,7 +385,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     placeholder = await update.message.reply_text(f"⏳ 使用模型: {selected_model}")
     reply = await stream_reply(placeholder, msgs, selected_model)
-    if reply and reply != "image_generated":
+    if reply and reply not in ["image_generated", "video_generated"]:
         hist.append({"role": "assistant", "content": reply})
 
 
@@ -415,7 +430,7 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     placeholder = await update.message.reply_text(f"⏳ 分析图片中... (模型: {selected_model})")
     reply = await stream_reply(placeholder, msgs, selected_model)
-    if reply and reply != "image_generated":
+    if reply and reply not in ["image_generated", "video_generated"]:
         hist.append({"role": "user", "content": f"[photo] {clean_caption}"})
         hist.append({"role": "assistant", "content": reply})
 
@@ -458,7 +473,7 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     placeholder = await update.message.reply_text(f"🎤 \"{text}\"\n\n⏳ 处理中...")
     reply = await stream_reply(placeholder, msgs, model)
-    if reply and reply != "image_generated":
+    if reply and reply not in ["image_generated", "video_generated"]:
         hist.append({"role": "assistant", "content": reply})
 
 
@@ -482,7 +497,6 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
-    app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_photo))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
