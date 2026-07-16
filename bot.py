@@ -189,19 +189,27 @@ async def generate_image(prompt: str) -> str:
 async def generate_image_edit(prompt: str, image_base64: str) -> str:
     """图生图：输入图片+文字，修改/修复图片"""
     gen_url = f"{BASE_URL}/images/edits"
-    payload = {
-        "model": "gpt-image-2",
+    
+    # 将 base64 解码为二进制
+    image_bytes = base64.b64decode(image_base64)
+    
+    # 构造 multipart/form-data 格式
+    files = {
+        "image": ("image.png", io.BytesIO(image_bytes), "image/png")
+    }
+    data = {
         "prompt": prompt,
-        "image": f"data:image/png;base64,{image_base64}",
-        "n": 1
+        "model": "gpt-image-2",
+        "n": "1"
     }
     headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json"
+        "Authorization": f"Bearer {API_KEY}"
+        # 不设置 Content-Type，让 httpx 自动生成 multipart/form-data
     }
+    
     try:
         async with httpx.AsyncClient(timeout=120.0) as http:
-            resp = await http.post(gen_url, json=payload, headers=headers)
+            resp = await http.post(gen_url, files=files, data=data, headers=headers)
             data = resp.json()
         if resp.status_code != 200:
             return f"Image edit error: {data.get('error', {}).get('message', resp.text)}"
@@ -368,7 +376,7 @@ async def stream_reply(msg, messages, model, image_base64: str = None):
         if not prompt:
             prompt = user_content
 
-        # 🔥 如果有图片，走图生图（修改/修复）
+        # 如果有图片，走图生图（修改/修复）
         if image_base64:
             result = await generate_image_edit(prompt, image_base64)
         else:
@@ -463,7 +471,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not raw_text:
         return
 
-    # 🔥 检测是否有图片附件
+    # 检测是否有图片附件
     image_base64 = None
     if update.message.photo:
         photo_file = update.message.photo[-1]
