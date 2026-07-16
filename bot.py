@@ -4,6 +4,7 @@ import sys
 import io
 import re
 import time
+import asyncio
 import base64
 import logging
 import json
@@ -189,9 +190,9 @@ async def generate_image(prompt: str) -> str:
 async def generate_image_edit(prompt: str, image_base64: str) -> str:
     """图生图：输入图片+文字，修改/修复图片"""
     gen_url = f"{BASE_URL}/images/edits"
-    
+
     image_bytes = base64.b64decode(image_base64)
-    
+
     files = {
         "image": ("image.png", io.BytesIO(image_bytes), "image/png")
     }
@@ -203,7 +204,7 @@ async def generate_image_edit(prompt: str, image_base64: str) -> str:
     headers = {
         "Authorization": f"Bearer {API_KEY}"
     }
-    
+
     try:
         async with httpx.AsyncClient(timeout=120.0) as http:
             resp = await http.post(gen_url, files=files, data=data, headers=headers)
@@ -227,6 +228,61 @@ async def generate_image_edit(prompt: str, image_base64: str) -> str:
         return f"Image edit failed: {str(e)}"
 
 
+# ============================================
+# Kling 视频：异步任务轮询
+# ============================================
+async def poll_kling_task(gen_url: str, task_id: str, max_wait: int = 240, interval: int = 8) -> dict:
+    """轮询 Kling 任务状态，直到成功、失败或超时。
+    注意：查询 URL 目前假设为 "{创建任务的URL}/{task_id}"，这是 Kling 官方接口
+    及大多数代理常见的模式。如果 yunwu.ai 的真实查询路径不同，这里会在日志里
+    打印出真实返回内容，方便据此调整 status_url 的拼接方式。
+    """
+    status_url = f"{gen_url}/{task_id}"
+    headers = {"Authorization": f"Bearer {API_KEY}"}
+    elapsed = 0
+    async with httpx.AsyncClient(timeout=30.0) as http:
+        while elapsed < max_wait:
+            try:
+                resp = await http.get(status_url, headers=headers)
+            except Exception as e:
+                log.error("poll: 请求失败: %s", e)
+                return {"error": f"Poll request failed: {e}"}
+
+            try:
+                data = resp.json()
+            except Exception:
+                log.error("poll: 返回非 JSON: %s", resp.text[:300])
+                return {"error": f"Unexpected response: {resp.text[:200]}"}
+
+            task = data.get("data", {})
+            status = task.get("task_status")
+            log.info("kling task %s status=%s raw=%s", task_id, status, json.dumps(data)[:300])
+
+            if status == "succeed":
+                return task
+            if status == "failed":
+                return {"error": task.get("task_status_msg", "Task failed")}
+
+            await asyncio.sleep(interval)
+            elapsed += interval
+    return {"error": "Timed out waiting for video generation"}
+
+
+def extract_video_url(result: dict) -> str:
+    """从 Kling 任务成功结果中提取视频 URL，兼容几种常见返回结构"""
+    works = result.get("works") or result.get("videos") or []
+    if works:
+        video = works[0].get("video", works[0]) if isinstance(works[0], dict) else {}
+        url = video.get("resource") or video.get("url") or video.get("resource_without_watermark")
+        if url:
+            return url
+    if "video_url" in result:
+        return result["video_url"]
+    if "url" in result:
+        return result["url"]
+    return ""
+
+
 async def generate_video_with_image(prompt: str, image_base64: str) -> str:
     """图生视频：输入图片+文字，生成视频"""
     gen_url = "https://yunwu.ai/kling/image-to-video/kling-3.0-turbo"
@@ -248,22 +304,25 @@ async def generate_video_with_image(prompt: str, image_base64: str) -> str:
         "Content-Type": "application/json"
     }
     try:
-        async with httpx.AsyncClient(timeout=300.0) as http:
+        async with httpx.AsyncClient(timeout=60.0) as http:
             resp = await http.post(gen_url, json=payload, headers=headers)
             data = resp.json()
+
         if resp.status_code != 200:
-            return f"Video generation error: {data.get('error', {}).get('message', resp.text)}"
-        if "data" in data and len(data["data"]) > 0:
-            item = data["data"][0]
-            if "url" in item and item["url"]:
-                return item["url"]
-            if "video_url" in item:
-                return item["video_url"]
-        if "url" in data:
-            return data["url"]
-        if "video_url" in data:
-            return data["video_url"]
-        return f"Unexpected response: {json.dumps(data)[:200]}"
+            return f"Video generation error: {data.get('message', resp.text)}"
+
+        task_id = data.get("data", {}).get("task_id")
+        if not task_id:
+            return f"Unexpected response: {json.dumps(data)[:200]}"
+
+        result = await poll_kling_task(gen_url, task_id)
+        if "error" in result:
+            return f"Video generation error: {result['error']}"
+
+        video_url = extract_video_url(result)
+        if video_url:
+            return video_url
+        return f"Unexpected result shape: {json.dumps(result)[:200]}"
     except Exception as e:
         return f"Video generation failed: {str(e)}"
 
@@ -285,22 +344,25 @@ async def generate_video_text_only(prompt: str) -> str:
         "Content-Type": "application/json"
     }
     try:
-        async with httpx.AsyncClient(timeout=300.0) as http:
+        async with httpx.AsyncClient(timeout=60.0) as http:
             resp = await http.post(gen_url, json=payload, headers=headers)
             data = resp.json()
+
         if resp.status_code != 200:
-            return f"Video generation error: {data.get('error', {}).get('message', resp.text)}"
-        if "data" in data and len(data["data"]) > 0:
-            item = data["data"][0]
-            if "url" in item and item["url"]:
-                return item["url"]
-            if "video_url" in item:
-                return item["video_url"]
-        if "url" in data:
-            return data["url"]
-        if "video_url" in data:
-            return data["video_url"]
-        return f"Unexpected response: {json.dumps(data)[:200]}"
+            return f"Video generation error: {data.get('message', resp.text)}"
+
+        task_id = data.get("data", {}).get("task_id")
+        if not task_id:
+            return f"Unexpected response: {json.dumps(data)[:200]}"
+
+        result = await poll_kling_task(gen_url, task_id)
+        if "error" in result:
+            return f"Video generation error: {result['error']}"
+
+        video_url = extract_video_url(result)
+        if video_url:
+            return video_url
+        return f"Unexpected result shape: {json.dumps(result)[:200]}"
     except Exception as e:
         return f"Video generation failed: {str(e)}"
 
@@ -541,6 +603,13 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.error("failed to process photo: %s", e)
         await update.message.reply_text("Couldn't process the image. Try again?")
+        return
+
+    selected_model_type = get_model_type(selected_model)
+
+    if selected_model_type in ("video", "image"):
+        placeholder = await update.message.reply_text(f"⏳ 使用模型: {selected_model}")
+        reply = await stream_reply(placeholder, [{"role": "user", "content": clean_caption}], selected_model, b64)
         return
 
     vision_msg = {
