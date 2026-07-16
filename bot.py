@@ -229,57 +229,87 @@ async def generate_image_edit(prompt: str, image_base64: str) -> str:
 
 
 # ============================================
-# Kling 视频：异步任务轮询
+# Kling 视频：异步任务轮询 (修复版)
 # ============================================
-async def poll_kling_task(gen_url: str, task_id: str, max_wait: int = 240, interval: int = 8) -> dict:
-    """轮询 Kling 任务状态，直到成功、失败或超时。
-    注意：查询 URL 目前假设为 "{创建任务的URL}/{task_id}"，这是 Kling 官方接口
-    及大多数代理常见的模式。如果 yunwu.ai 的真实查询路径不同，这里会在日志里
-    打印出真实返回内容，方便据此调整 status_url 的拼接方式。
+async def poll_kling_task(task_id: str, task_type: str = "text-to-video", max_wait: int = 300, interval: int = 10) -> dict:
     """
-    status_url = f"{gen_url}/{task_id}"
+    轮询 Kling 任务状态，直到成功、失败或超时。
+    
+    yunwu.ai 的查询接口格式：
+    GET https://yunwu.ai/kling/{task_type}/kling-3.0-turbo/{task_id}
+    """
+    status_url = f"https://yunwu.ai/kling/{task_type}/kling-3.0-turbo/{task_id}"
     headers = {"Authorization": f"Bearer {API_KEY}"}
     elapsed = 0
+    
     async with httpx.AsyncClient(timeout=30.0) as http:
         while elapsed < max_wait:
             try:
                 resp = await http.get(status_url, headers=headers)
+                data = resp.json()
             except Exception as e:
                 log.error("poll: 请求失败: %s", e)
-                return {"error": f"Poll request failed: {e}"}
+                await asyncio.sleep(interval)
+                elapsed += interval
+                continue
 
-            try:
-                data = resp.json()
-            except Exception:
-                log.error("poll: 返回非 JSON: %s", resp.text[:300])
-                return {"error": f"Unexpected response: {resp.text[:200]}"}
+            log.info("kling task %s response: %s", task_id, json.dumps(data)[:500])
 
-            task = data.get("data", {})
-            status = task.get("task_status")
-            log.info("kling task %s status=%s raw=%s", task_id, status, json.dumps(data)[:300])
+            # 检查 API 返回码
+            if data.get("code") != 0:
+                return {"error": data.get("message", "API error")}
 
-            if status == "succeed":
-                return task
+            task_data = data.get("data", {})
+            
+            # yunwu.ai 返回的状态字段是 "status"，不是 "task_status"
+            status = task_data.get("status", "").lower()
+            
+            # 可能的状态: submitted, processing, succeed/success, failed
+            if status in ("succeed", "success", "completed"):
+                return task_data
             if status == "failed":
-                return {"error": task.get("task_status_msg", "Task failed")}
-
+                return {"error": task_data.get("message", "Task failed")}
+            
+            # 还在处理中 (submitted, processing, pending 等)
+            log.info("kling task %s status: %s, waiting...", task_id, status)
             await asyncio.sleep(interval)
             elapsed += interval
-    return {"error": "Timed out waiting for video generation"}
+            
+    return {"error": f"Timed out after {max_wait}s waiting for video generation"}
 
 
 def extract_video_url(result: dict) -> str:
-    """从 Kling 任务成功结果中提取视频 URL，兼容几种常见返回结构"""
+    """从 Kling 任务成功结果中提取视频 URL，兼容多种返回结构"""
+    
+    # 尝试各种可能的字段名
+    # 1. works 数组
     works = result.get("works") or result.get("videos") or []
     if works:
-        video = works[0].get("video", works[0]) if isinstance(works[0], dict) else {}
-        url = video.get("resource") or video.get("url") or video.get("resource_without_watermark")
-        if url:
-            return url
-    if "video_url" in result:
-        return result["video_url"]
-    if "url" in result:
-        return result["url"]
+        work = works[0] if isinstance(works, list) else works
+        if isinstance(work, dict):
+            video = work.get("video", work)
+            url = (video.get("resource") or 
+                   video.get("url") or 
+                   video.get("resource_without_watermark") or
+                   video.get("video_url"))
+            if url:
+                return url
+    
+    # 2. 直接的 URL 字段
+    for field in ["video_url", "url", "output_url", "result_url", "file_url"]:
+        if result.get(field):
+            return result[field]
+    
+    # 3. output 字段
+    output = result.get("output")
+    if output:
+        if isinstance(output, str) and output.startswith("http"):
+            return output
+        if isinstance(output, list) and output:
+            return output[0] if isinstance(output[0], str) else output[0].get("url", "")
+        if isinstance(output, dict):
+            return output.get("url", "")
+    
     return ""
 
 
@@ -287,43 +317,44 @@ async def generate_video_with_image(prompt: str, image_base64: str) -> str:
     """图生视频：输入图片+文字，生成视频"""
     gen_url = "https://yunwu.ai/kling/image-to-video/kling-3.0-turbo"
     payload = {
-        "contents": [
-            {
-                "type": "prompt",
-                "text": prompt
-            },
-            {
-                "type": "first_frame",
-                "url": f"data:image/jpeg;base64,{image_base64}"
-            }
-        ],
-        "model": "kling-3.0-turbo"
+        "model": "kling-3.0-turbo",
+        "prompt": prompt,
+        "image": f"data:image/jpeg;base64,{image_base64}"
     }
     headers = {
         "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json"
     }
+    
     try:
         async with httpx.AsyncClient(timeout=60.0) as http:
             resp = await http.post(gen_url, json=payload, headers=headers)
             data = resp.json()
 
-        if resp.status_code != 200:
+        log.info("kling image-to-video submit response: %s", json.dumps(data)[:500])
+
+        if data.get("code") != 0:
             return f"Video generation error: {data.get('message', resp.text)}"
 
-        task_id = data.get("data", {}).get("task_id")
+        # 获取任务 ID - 可能是 task_id 或 id
+        task_id = data.get("data", {}).get("task_id") or data.get("data", {}).get("id")
         if not task_id:
-            return f"Unexpected response: {json.dumps(data)[:200]}"
+            return f"No task_id in response: {json.dumps(data)[:200]}"
 
-        result = await poll_kling_task(gen_url, task_id)
+        log.info("kling task submitted: %s, polling...", task_id)
+
+        # 轮询等待结果
+        result = await poll_kling_task(task_id, task_type="image-to-video")
         if "error" in result:
             return f"Video generation error: {result['error']}"
 
         video_url = extract_video_url(result)
         if video_url:
             return video_url
-        return f"Unexpected result shape: {json.dumps(result)[:200]}"
+        return f"Could not find video URL in result: {json.dumps(result)[:200]}"
+        
     except Exception as e:
+        log.exception("generate_video_with_image failed")
         return f"Video generation failed: {str(e)}"
 
 
@@ -331,39 +362,43 @@ async def generate_video_text_only(prompt: str) -> str:
     """文生视频：只输入文字，生成视频"""
     gen_url = "https://yunwu.ai/kling/text-to-video/kling-3.0-turbo"
     payload = {
-        "contents": [
-            {
-                "type": "prompt",
-                "text": prompt
-            }
-        ],
-        "model": "kling-3.0-turbo"
+        "model": "kling-3.0-turbo",
+        "prompt": prompt
     }
     headers = {
         "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json"
     }
+    
     try:
         async with httpx.AsyncClient(timeout=60.0) as http:
             resp = await http.post(gen_url, json=payload, headers=headers)
             data = resp.json()
 
-        if resp.status_code != 200:
+        log.info("kling text-to-video submit response: %s", json.dumps(data)[:500])
+
+        if data.get("code") != 0:
             return f"Video generation error: {data.get('message', resp.text)}"
 
-        task_id = data.get("data", {}).get("task_id")
+        # 获取任务 ID - 可能是 task_id 或 id
+        task_id = data.get("data", {}).get("task_id") or data.get("data", {}).get("id")
         if not task_id:
-            return f"Unexpected response: {json.dumps(data)[:200]}"
+            return f"No task_id in response: {json.dumps(data)[:200]}"
 
-        result = await poll_kling_task(gen_url, task_id)
+        log.info("kling task submitted: %s, polling...", task_id)
+
+        # 轮询等待结果
+        result = await poll_kling_task(task_id, task_type="text-to-video")
         if "error" in result:
             return f"Video generation error: {result['error']}"
 
         video_url = extract_video_url(result)
         if video_url:
             return video_url
-        return f"Unexpected result shape: {json.dumps(result)[:200]}"
+        return f"Could not find video URL in result: {json.dumps(result)[:200]}"
+        
     except Exception as e:
+        log.exception("generate_video_text_only failed")
         return f"Video generation failed: {str(e)}"
 
 
@@ -423,6 +458,8 @@ async def stream_reply(msg, messages, model, image_base64: str = None):
         if not prompt:
             prompt = user_content
 
+        await msg.edit_text("🎬 视频生成中，请稍候（约2-5分钟）...")
+
         if image_base64:
             result = await generate_video_with_image(prompt, image_base64)
         else:
@@ -432,8 +469,9 @@ async def stream_reply(msg, messages, model, image_base64: str = None):
             try:
                 await msg.reply_video(result, caption=prompt[:200] if prompt else None)
                 await msg.edit_text("🎬 视频已生成！")
-            except Exception:
-                await msg.edit_text(f"生成的视频：{result}")
+            except Exception as e:
+                log.error("发送视频失败: %s", e)
+                await msg.edit_text(f"🎬 视频生成完成！\n链接：{result}")
         else:
             await msg.edit_text(f"❌ {result}")
         return "video_generated"
@@ -621,96 +659,4 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     }
 
     hist = get_hist(uid)
-    msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + hist + [vision_msg]
-
-    placeholder = await update.message.reply_text(f"⏳ 分析图片中... (模型: {selected_model})")
-    reply = await stream_reply(placeholder, msgs, selected_model, b64)
-    if reply and reply not in ["image_generated", "video_generated"]:
-        hist.append({"role": "user", "content": f"[photo] {clean_caption}"})
-        hist.append({"role": "assistant", "content": reply})
-
-
-async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not allowed(uid):
-        return
-
-    voice = update.message.voice or update.message.audio
-    if not voice:
-        return
-
-    try:
-        file = await ctx.bot.get_file(voice.file_id)
-        raw = await file.download_as_bytearray()
-        audio_file = io.BytesIO(raw)
-        audio_file.name = "voice.ogg"
-        transcript = await client.audio.transcriptions.create(
-            model="whisper-1", file=audio_file,
-        )
-        text = transcript.text.strip()
-    except Exception as e:
-        log.warning("transcription failed: %s", e)
-        await update.message.reply_text("Voice transcription isn't supported by your current API provider.")
-        return
-
-    if not text:
-        await update.message.reply_text("(couldn't make out the audio)")
-        return
-
-    hist = get_hist(uid)
-    hist.append({"role": "user", "content": text})
-
-    while len(hist) > MAX_HISTORY:
-        hist.pop(0)
-
-    msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + hist
-    model = user_models.get(uid, DEFAULT_MODEL)
-
-    placeholder = await update.message.reply_text(f"🎤 \"{text}\"\n\n⏳ 处理中...")
-    reply = await stream_reply(placeholder, msgs, model)
-    if reply and reply not in ["image_generated", "video_generated"]:
-        hist.append({"role": "assistant", "content": reply})
-
-
-def main():
-    global _bot_username
-
-    if not BOT_TOKEN:
-        print("Error: BOT_TOKEN not set.")
-        sys.exit(1)
-
-    if not API_KEY:
-        print("Error: API_KEY not set.")
-        sys.exit(1)
-
-    logging.basicConfig(
-        format="%(asctime)s [%(name)s] %(message)s",
-        level=logging.INFO,
-    )
-
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_start))
-    app.add_handler(CommandHandler("clear", cmd_clear))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_photo))
-    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-
-    async def on_error(update, ctx):
-        log.error("unhandled error: %s", ctx.error, exc_info=ctx.error)
-
-    app.add_error_handler(on_error)
-
-    async def post_init(application):
-        global _bot_username
-        bot = await application.bot.get_me()
-        _bot_username = bot.username
-        log.info("bot @%s started — default model: %s", _bot_username, DEFAULT_MODEL)
-
-    app.post_init = post_init
-    app.run_polling(drop_pending_updates=True)
-
-
-if __name__ == "__main__":
-    main()
+    msgs
