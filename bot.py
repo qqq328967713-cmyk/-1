@@ -7,11 +7,11 @@ import time
 import base64
 import logging
 import json
-
+import httpx
 from PIL import Image
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-from telegram import Update
+from telegram import Update, InputFile
 from telegram.constants import ParseMode, ChatType
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -19,8 +19,8 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 API_KEY = os.getenv("API_KEY", "")
-BASE_URL = os.getenv("BASE_URL", "https://api.tokenmix.ai/v1")
-MODEL = os.getenv("MODEL", "gpt-4o-mini")
+BASE_URL = os.getenv("BASE_URL", "https://yunwu.ai/v1")
+MODEL = os.getenv("MODEL", "gpt-image-2")
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))
 ALLOWED_USERS = os.getenv("ALLOWED_USERS", "")
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "You are a helpful assistant.")
@@ -47,7 +47,6 @@ def get_hist(uid):
 
 
 def should_reply(update: Update) -> bool:
-    """In groups, only reply when @mentioned or replied to."""
     msg = update.message
     if msg.chat.type == ChatType.PRIVATE:
         return True
@@ -116,7 +115,7 @@ async def send_long(msg, text):
 
 
 async def generate_image(prompt: str) -> str:
-    """Call /images/generations endpoint."""
+    """调用 /images/generations 接口，返回图片 URL 或 base64 数据"""
     gen_url = f"{BASE_URL}/images/generations"
     payload = {
         "model": MODEL,
@@ -128,22 +127,54 @@ async def generate_image(prompt: str) -> str:
         "Content-Type": "application/json"
     }
     try:
-        import httpx
         async with httpx.AsyncClient(timeout=60.0) as http:
             resp = await http.post(gen_url, json=payload, headers=headers)
             data = resp.json()
         if resp.status_code != 200:
             return f"Image generation error: {data.get('error', {}).get('message', resp.text)}"
+
+        # 兼容不同接口返回格式
         if "data" in data and len(data["data"]) > 0:
-            return data["data"][0].get("url") or data["data"][0].get("b64_json") or str(data["data"][0])
-        elif "url" in data:
+            item = data["data"][0]
+            if "url" in item and item["url"]:
+                return item["url"]
+            if "b64_json" in item and item["b64_json"]:
+                return f"data:image/png;base64,{item['b64_json']}"
+        if "url" in data:
             return data["url"]
-        elif "output" in data:
-            return data["output"][0] if isinstance(data["output"], list) else str(data["output"])
-        else:
-            return f"Image generated, but unexpected response format: {json.dumps(data)[:200]}"
+        if "output" in data:
+            output = data["output"][0] if isinstance(data["output"], list) else data["output"]
+            if isinstance(output, str) and (output.startswith("http") or output.startswith("data:")):
+                return output
+        return f"Unexpected response: {json.dumps(data)[:200]}"
     except Exception as e:
         return f"Image generation failed: {str(e)}"
+
+
+async def send_image_result(msg, result: str, original_prompt: str = ""):
+    """统一处理图片发送：支持 URL、base64、纯文本错误"""
+    if result.startswith("http") or result.startswith("data:image"):
+        # 直接发送图片
+        try:
+            await msg.reply_photo(result, caption=original_prompt[:200] if original_prompt else None)
+            await msg.edit_text("✅ 绘图已完成")
+            return True
+        except Exception as e:
+            log.error("发送图片失败: %s", e)
+            # 如果 URL 无效，尝试用 InputFile 方式（仅限 base64）
+            if result.startswith("data:image"):
+                try:
+                    # 从 data:image/png;base64, 格式中提取纯 base64
+                    base64_data = result.split(",")[1] if "," in result else result
+                    image_bytes = base64.b64decode(base64_data)
+                    await msg.reply_photo(InputFile(io.BytesIO(image_bytes), filename="image.png"))
+                    await msg.edit_text("✅ 绘图已完成")
+                    return True
+                except Exception as e2:
+                    log.error("base64 发送失败: %s", e2)
+    # 如果是错误信息或其他文本，直接显示
+    await msg.edit_text(f"❌ {result}")
+    return False
 
 
 async def stream_reply(msg, messages, model):
@@ -157,23 +188,21 @@ async def stream_reply(msg, messages, model):
             user_content = m.get("content", "")
             break
 
-    if any(kw in user_content for kw in ["画", "生成", "图片", "照片", "图", "绘", "create", "generate", "draw", "image", "picture"]):
+    # 🔥 判断是否为生图请求
+    is_image_request = any(kw in user_content for kw in ["画", "生成", "图片", "照片", "图", "绘", "create", "generate", "draw", "image", "picture"])
+
+    if is_image_request:
         prompt = user_content
         for prefix in ["画", "生成", "图片", "照片", "图", "绘", "create", "generate", "draw", "image", "picture"]:
             prompt = prompt.replace(prefix, "").strip()
         if not prompt:
             prompt = user_content
+
         result = await generate_image(prompt)
-        if result.startswith("http") or result.startswith("data:image"):
-            try:
-                await msg.reply_photo(result)
-                await msg.edit_text("🖼️ Image generated!")
-            except Exception:
-                await msg.edit_text(f"Generated image: {result}")
-        else:
-            await msg.edit_text(result)
+        await send_image_result(msg, result, prompt)
         return "image_generated"
 
+    # 普通聊天流
     try:
         stream = await client.chat.completions.create(
             model=model, messages=messages, stream=True,
@@ -195,10 +224,7 @@ async def stream_reply(msg, messages, model):
     except Exception as e:
         err = str(e)
         if "401" in err or "403" in err or "Incorrect API key" in err:
-            await msg.edit_text(
-                "Error: Authentication failed — check API_KEY in .env\n"
-                "Get a key at https://tokenmix.ai ($1 free credit)"
-            )
+            await msg.edit_text("Error: Authentication failed — check API_KEY in .env")
         elif "429" in err:
             await msg.edit_text("Rate limited — wait a moment and try again.")
         else:
