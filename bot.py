@@ -17,19 +17,36 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 load_dotenv()
 
+# ============================================
+# 基础配置
+# ============================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 API_KEY = os.getenv("API_KEY", "")
-BASE_URL = os.getenv("BASE_URL", "https://yunwu.ai/v1")
-MODEL = os.getenv("MODEL", "gpt-image-2")
+BASE_URL = os.getenv("BASE_URL", "https://api.tokenmix.ai/v1")
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))
 ALLOWED_USERS = os.getenv("ALLOWED_USERS", "")
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "You are a helpful assistant.")
+
+# ============================================
+# 多模型配置（通过指令前缀切换）
+# ============================================
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-4o-mini")
+
+# 模型映射表：指令前缀 -> 模型ID
+MODEL_MAP = {
+    "NB": "gpt-image-2",          # 图片生成
+    "A": "gemini-3.1-pro-preview", # Gemini Pro
+    "ZZ": "claude-sonnet-5",       # Claude Sonnet
+    "SP": "kling-3.0-turbo",       # Kling
+}
+# 可用模型列表（用于展示）
+AVAILABLE_MODELS = list(MODEL_MAP.values()) + [DEFAULT_MODEL]
 
 log = logging.getLogger(__name__)
 client = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL)
 
 histories = {}
-user_models = {}
+user_models = {}  # 记录用户最后使用的模型
 _bot_username = None
 
 
@@ -63,6 +80,39 @@ def strip_mention(text: str) -> str:
     if _bot_username:
         text = text.replace(f"@{_bot_username}", "").strip()
     return text
+
+
+def detect_model_from_text(text: str) -> tuple:
+    """
+    检测文本中的指令前缀，返回 (模型ID, 去除前缀后的文本)
+    示例：
+        "NB 画一只猫" -> ("gpt-image-2", "画一只猫")
+        "ZZ 你好" -> ("claude-sonnet-5", "你好")
+        "你好" -> (None, "你好")
+    """
+    text = text.strip()
+    if not text:
+        return None, text
+
+    # 检查是否以指令前缀开头（不区分大小写）
+    for prefix, model_id in MODEL_MAP.items():
+        # 匹配 "NB " 或 "NB:" 或 "NB\n" 等
+        pattern = rf"^(?i){prefix}[\s:：\n]+"
+        match = re.match(pattern, text)
+        if match:
+            clean_text = text[match.end():].strip()
+            return model_id, clean_text
+
+    # 也支持 "NB" 后无空格的情况（如 "NB画一只猫"）
+    for prefix, model_id in MODEL_MAP.items():
+        if text.upper().startswith(prefix.upper()):
+            # 检查前缀后面的字符是否是非字母
+            next_char = text[len(prefix):].strip()[:1] if len(text) > len(prefix) else ""
+            if not next_char or not next_char.isalpha():
+                clean_text = text[len(prefix):].strip()
+                return model_id, clean_text
+
+    return None, text
 
 
 def escape_md(text: str) -> str:
@@ -115,10 +165,10 @@ async def send_long(msg, text):
 
 
 async def generate_image(prompt: str) -> str:
-    """调用 /images/generations 接口，返回图片 URL 或 base64 数据"""
+    """调用 /images/generations 接口"""
     gen_url = f"{BASE_URL}/images/generations"
     payload = {
-        "model": MODEL,
+        "model": "gpt-image-2",  # 固定用图片模型
         "prompt": prompt,
         "n": 1
     }
@@ -133,7 +183,6 @@ async def generate_image(prompt: str) -> str:
         if resp.status_code != 200:
             return f"Image generation error: {data.get('error', {}).get('message', resp.text)}"
 
-        # 兼容不同接口返回格式
         if "data" in data and len(data["data"]) > 0:
             item = data["data"][0]
             if "url" in item and item["url"]:
@@ -152,19 +201,15 @@ async def generate_image(prompt: str) -> str:
 
 
 async def send_image_result(msg, result: str, original_prompt: str = ""):
-    """统一处理图片发送：支持 URL、base64、纯文本错误"""
     if result.startswith("http") or result.startswith("data:image"):
-        # 直接发送图片
         try:
             await msg.reply_photo(result, caption=original_prompt[:200] if original_prompt else None)
             await msg.edit_text("✅ 绘图已完成")
             return True
         except Exception as e:
             log.error("发送图片失败: %s", e)
-            # 如果 URL 无效，尝试用 InputFile 方式（仅限 base64）
             if result.startswith("data:image"):
                 try:
-                    # 从 data:image/png;base64, 格式中提取纯 base64
                     base64_data = result.split(",")[1] if "," in result else result
                     image_bytes = base64.b64decode(base64_data)
                     await msg.reply_photo(InputFile(io.BytesIO(image_bytes), filename="image.png"))
@@ -172,7 +217,6 @@ async def send_image_result(msg, result: str, original_prompt: str = ""):
                     return True
                 except Exception as e2:
                     log.error("base64 发送失败: %s", e2)
-    # 如果是错误信息或其他文本，直接显示
     await msg.edit_text(f"❌ {result}")
     return False
 
@@ -188,16 +232,15 @@ async def stream_reply(msg, messages, model):
             user_content = m.get("content", "")
             break
 
-    # 🔥 判断是否为生图请求
-    is_image_request = any(kw in user_content for kw in ["画", "生成", "图片", "照片", "图", "绘", "create", "generate", "draw", "image", "picture"])
+    # 判断是否为生图请求（NB 前缀已确保使用图片模型，这里额外检测关键词）
+    is_image_request = model == "gpt-image-2" or any(kw in user_content for kw in ["画", "生成", "图片", "照片", "图", "绘"])
 
-    if is_image_request:
+    if is_image_request and model == "gpt-image-2":
         prompt = user_content
         for prefix in ["画", "生成", "图片", "照片", "图", "绘", "create", "generate", "draw", "image", "picture"]:
             prompt = prompt.replace(prefix, "").strip()
         if not prompt:
             prompt = user_content
-
         result = await generate_image(prompt)
         await send_image_result(msg, result, prompt)
         return "image_generated"
@@ -240,55 +283,76 @@ async def stream_reply(msg, messages, model):
     return full
 
 
+# ============================================
+# 命令处理器
+# ============================================
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    model_list = "\n".join([f"  • `{prefix}` → {model}" for prefix, model in MODEL_MAP.items()])
     await update.message.reply_text(
-        "Send me a message and I'll reply using AI.\n"
-        "Send a photo with a caption to ask about images.\n"
-        "Send a voice message to transcribe + respond.\n\n"
-        "In groups, @ me or reply to my messages.\n\n"
-        "/model <name> — switch model\n"
-        "/clear — forget conversation context\n"
-        "/help — show this"
+        f"🤖 **多模型 Bot**\n\n"
+        f"在消息前加前缀即可切换模型：\n{model_list}\n\n"
+        f"示例：\n"
+        f"`NB 画一只猫` → 用 {MODEL_MAP['NB']} 生成图片\n"
+        f"`A 解释一下量子计算` → 用 {MODEL_MAP['A']} 回答\n"
+        f"`ZZ 写一段代码` → 用 {MODEL_MAP['ZZ']} 编程\n\n"
+        f"不加前缀则使用默认模型：`{DEFAULT_MODEL}`\n\n"
+        f"📷 发送图片+文字 → 图片分析\n"
+        f"🎤 发送语音 → 语音转录\n"
+        f"👥 群聊中 @我 或回复我的消息",
+        parse_mode=ParseMode.MARKDOWN_V2
     )
 
 
 async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    parts = update.message.text.split(maxsplit=1)
-    uid = update.effective_user.id
-    if len(parts) < 2:
-        cur = user_models.get(uid, MODEL)
-        await update.message.reply_text(f"Current: {cur}\nUsage: /model gpt-4o")
-        return
-    name = parts[1].strip()
-    user_models[uid] = name
-    await update.message.reply_text(f"Switched to {name}")
+    """查看当前可用模型"""
+    lines = ["**可用模型前缀：**"]
+    for prefix, model in MODEL_MAP.items():
+        lines.append(f"  • `{prefix}` → {model}")
+    lines.append(f"  • (无前缀) → {DEFAULT_MODEL}")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
 
 
 async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     histories[update.effective_user.id] = []
-    await update.message.reply_text("Context cleared — I won't remember previous messages.")
+    await update.message.reply_text("✅ 对话已重置")
 
 
+# ============================================
+# 消息处理器
+# ============================================
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not allowed(uid) or not should_reply(update):
         return
 
-    text = strip_mention(update.message.text)
-    if not text:
+    raw_text = strip_mention(update.message.text)
+    if not raw_text:
         return
 
+    # 检测模型前缀
+    selected_model, clean_text = detect_model_from_text(raw_text)
+    if selected_model is None:
+        selected_model = DEFAULT_MODEL
+
+    # 记录用户最后使用的模型
+    user_models[uid] = selected_model
+
+    # 如果用户用了 "NB" 前缀但没给 prompt，提示一下
+    if selected_model == "gpt-image-2" and not clean_text:
+        await update.message.reply_text("请告诉我你想画什么，比如：`NB 一只猫`", parse_mode=ParseMode.MARKDOWN_V2)
+        return
+
+    # 保存历史
     hist = get_hist(uid)
-    hist.append({"role": "user", "content": text})
+    hist.append({"role": "user", "content": clean_text})
 
     while len(hist) > MAX_HISTORY:
         hist.pop(0)
 
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + hist
-    model = user_models.get(uid, MODEL)
 
-    placeholder = await update.message.reply_text("...")
-    reply = await stream_reply(placeholder, msgs, model)
+    placeholder = await update.message.reply_text(f"⏳ 使用模型: {selected_model}")
+    reply = await stream_reply(placeholder, msgs, selected_model)
     if reply and reply != "image_generated":
         hist.append({"role": "assistant", "content": reply})
 
@@ -298,7 +362,10 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(uid) or not should_reply(update):
         return
 
-    caption = strip_mention(update.message.caption or "") or "What's in this image?"
+    raw_caption = strip_mention(update.message.caption or "") or "What's in this image?"
+    selected_model, clean_caption = detect_model_from_text(raw_caption)
+    if selected_model is None:
+        selected_model = DEFAULT_MODEL
 
     try:
         if update.message.photo:
@@ -321,19 +388,18 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     vision_msg = {
         "role": "user",
         "content": [
-            {"type": "text", "text": caption},
+            {"type": "text", "text": clean_caption},
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
         ],
     }
 
     hist = get_hist(uid)
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + hist + [vision_msg]
-    model = user_models.get(uid, MODEL)
 
-    placeholder = await update.message.reply_text("...")
-    reply = await stream_reply(placeholder, msgs, model)
+    placeholder = await update.message.reply_text(f"⏳ 分析图片中... (模型: {selected_model})")
+    reply = await stream_reply(placeholder, msgs, selected_model)
     if reply and reply != "image_generated":
-        hist.append({"role": "user", "content": f"[photo] {caption}"})
+        hist.append({"role": "user", "content": f"[photo] {clean_caption}"})
         hist.append({"role": "assistant", "content": reply})
 
 
@@ -357,10 +423,7 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text = transcript.text.strip()
     except Exception as e:
         log.warning("transcription failed: %s", e)
-        await update.message.reply_text(
-            "Voice transcription isn't supported by your current API provider.\n"
-            "Try typing your message instead."
-        )
+        await update.message.reply_text("Voice transcription isn't supported by your current API provider.")
         return
 
     if not text:
@@ -374,9 +437,9 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         hist.pop(0)
 
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + hist
-    model = user_models.get(uid, MODEL)
+    model = user_models.get(uid, DEFAULT_MODEL)
 
-    placeholder = await update.message.reply_text(f"\U0001f3a4 \"{text}\"\n\n...")
+    placeholder = await update.message.reply_text(f"🎤 \"{text}\"\n\n⏳ 处理中...")
     reply = await stream_reply(placeholder, msgs, model)
     if reply and reply != "image_generated":
         hist.append({"role": "assistant", "content": reply})
@@ -387,16 +450,10 @@ def main():
 
     if not BOT_TOKEN:
         print("Error: BOT_TOKEN not set.")
-        print("Get one from @BotFather on Telegram, then add it to .env")
         sys.exit(1)
 
     if not API_KEY:
-        print("Error: API key not configured.")
-        print("")
-        print("To get started:")
-        print("  1. Get a free API key at https://tokenmix.ai ($1 free credit)")
-        print("     Or use any OpenAI-compatible API provider")
-        print("  2. Set API_KEY in .env")
+        print("Error: API_KEY not set.")
         sys.exit(1)
 
     logging.basicConfig(
@@ -423,7 +480,7 @@ def main():
         global _bot_username
         bot = await application.bot.get_me()
         _bot_username = bot.username
-        log.info("bot @%s started — model=%s", _bot_username, MODEL)
+        log.info("bot @%s started — default model: %s", _bot_username, DEFAULT_MODEL)
 
     app.post_init = post_init
     app.run_polling(drop_pending_updates=True)
