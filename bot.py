@@ -7,7 +7,7 @@ import time
 import base64
 import logging
 import json
-import asyncio  # 🔥 添加这一行
+import asyncio
 import httpx
 from PIL import Image
 from dotenv import load_dotenv
@@ -229,7 +229,7 @@ async def generate_image_edit(prompt: str, image_base64: str) -> str:
 
 
 async def generate_video_with_image(prompt: str, image_base64: str) -> str:
-    """图生视频：输入图片+文字，生成视频（异步轮询）"""
+    """图生视频：提交任务并返回任务ID"""
     gen_url = "https://yunwu.ai/kling/image-to-video/kling-3.0-turbo"
     payload = {
         "contents": [
@@ -244,93 +244,34 @@ async def generate_video_with_image(prompt: str, image_base64: str) -> str:
     }
     
     try:
-        # 1. 提交任务
         async with httpx.AsyncClient(timeout=30.0) as http:
             resp = await http.post(gen_url, json=payload, headers=headers)
-            # 🔥 先打印原始响应文本
             raw_text = resp.text
-            log.info(f"Raw submit response: {raw_text[:500]}")
+            log.info(f"Video submit response: {raw_text}")
             
             if resp.status_code != 200:
                 return f"HTTP error: {resp.status_code} - {raw_text[:200]}"
             
             data = resp.json()
-        
-        log.info(f"Video submit response: {json.dumps(data, ensure_ascii=False)}")
-        
-        if data.get("code") != 0:
-            return f"Video generation error: {data.get('message', 'Unknown error')}"
-        
-        task_id = data.get("data", {}).get("id")
-        if not task_id:
-            return f"No task id in response: {json.dumps(data, ensure_ascii=False)[:200]}"
-        
-        # 2. 轮询任务状态 - 🔥 使用正确的查询接口
-        # 根据云雾AI的文档，查询接口可能是 GET /kling/image-to-video/task/{task_id}
-        status_url = f"https://yunwu.ai/kling/image-to-video/task/{task_id}"
-        max_attempts = 60
-        
-        for i in range(max_attempts):
-            await asyncio.sleep(5)
-            try:
-                async with httpx.AsyncClient(timeout=30.0) as http:
-                    status_resp = await http.get(status_url, headers=headers)
-                    # 🔥 检查状态码和响应
-                    if status_resp.status_code != 200:
-                        log.warning(f"Status API returned {status_resp.status_code}: {status_resp.text[:200]}")
-                        continue
-                    
-                    raw_status = status_resp.text
-                    if not raw_status or not raw_status.strip():
-                        log.warning("Empty status response")
-                        continue
-                    
-                    status_data = status_resp.json()
-            except Exception as e:
-                log.warning(f"Status query failed: {e}")
-                continue
             
-            task_status = status_data.get("data", {}).get("status")
-            log.info(f"Task {task_id} status: {task_status} (attempt {i+1}/{max_attempts})")
-            
-            if task_status == "completed":
-                video_url = (
-                    status_data.get("data", {}).get("video_url") or 
-                    status_data.get("data", {}).get("url") or 
-                    status_data.get("data", {}).get("video")
-                )
-                if video_url:
-                    return video_url
+            # 检查是否成功
+            if data.get("code") == 0:
+                task_id = data.get("data", {}).get("id")
+                if task_id:
+                    return f"✅ 视频任务已提交！任务ID: `{task_id}`\n请等待2-5分钟后查看结果。"
                 else:
-                    return f"Task completed but no video URL found: {json.dumps(status_data, ensure_ascii=False)[:300]}"
-            elif task_status in ["failed", "error"]:
-                err_msg = status_data.get("data", {}).get("message") or status_data.get("message") or "Unknown error"
-                return f"Video generation failed: {err_msg}"
-            elif task_status in ["submitted", "processing"]:
-                continue
-        
-        return "Video generation timeout (took more than 5 minutes)"
+                    return f"提交成功但未返回任务ID: {json.dumps(data, ensure_ascii=False)}"
+            else:
+                return f"提交失败: {data.get('message', 'Unknown error')}"
         
     except json.JSONDecodeError as e:
-        return f"JSON decode error: {str(e)}. Raw response: {raw_text[:200] if 'raw_text' in locals() else 'N/A'}"
+        return f"JSON解析错误: {str(e)}"
     except Exception as e:
-        return f"Video generation failed: {str(e)}"
+        return f"视频生成失败: {str(e)}"
 
 
 async def generate_video_text_only(prompt: str) -> str:
-    """文生视频：只输入文字，生成视频（异步轮询）"""
-    gen_url = "https://yunwu.ai/kling/text-to-video/kling-3.0-turbo"
-    payload = {
-        "contents": [{"type": "prompt", "text": prompt}],
-        "model": "kling-3.0-turbo"
-    }
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json"
-    }
-    
- async def generate_video_text_only(prompt: str) -> str:
-    """文生视频：只输入文字，生成视频（异步轮询）"""
+    """文生视频：提交任务并返回任务ID"""
     gen_url = "https://yunwu.ai/kling/text-to-video/kling-3.0-turbo"
     payload = {
         "contents": [{"type": "prompt", "text": prompt}],
@@ -345,67 +286,26 @@ async def generate_video_text_only(prompt: str) -> str:
         async with httpx.AsyncClient(timeout=30.0) as http:
             resp = await http.post(gen_url, json=payload, headers=headers)
             raw_text = resp.text
-            log.info(f"Raw text submit response: {raw_text[:500]}")
+            log.info(f"Video text submit response: {raw_text}")
             
             if resp.status_code != 200:
                 return f"HTTP error: {resp.status_code} - {raw_text[:200]}"
             
             data = resp.json()
-        
-        log.info(f"Video text submit response: {json.dumps(data, ensure_ascii=False)}")
-        
-        if data.get("code") != 0:
-            return f"Video generation error: {data.get('message', 'Unknown error')}"
-        
-        task_id = data.get("data", {}).get("id")
-        if not task_id:
-            return f"No task id in response: {json.dumps(data, ensure_ascii=False)[:200]}"
-        
-        status_url = f"https://yunwu.ai/kling/text-to-video/task/{task_id}"
-        max_attempts = 60
-        
-        for i in range(max_attempts):
-            await asyncio.sleep(5)
-            try:
-                async with httpx.AsyncClient(timeout=30.0) as http:
-                    status_resp = await http.get(status_url, headers=headers)
-                    if status_resp.status_code != 200:
-                        log.warning(f"Status API returned {status_resp.status_code}: {status_resp.text[:200]}")
-                        continue
-                    raw_status = status_resp.text
-                    if not raw_status or not raw_status.strip():
-                        log.warning("Empty status response")
-                        continue
-                    status_data = status_resp.json()
-            except Exception as e:
-                log.warning(f"Status query failed: {e}")
-                continue
             
-            task_status = status_data.get("data", {}).get("status")
-            log.info(f"Task {task_id} status: {task_status} (attempt {i+1}/{max_attempts})")
-            
-            if task_status == "completed":
-                video_url = (
-                    status_data.get("data", {}).get("video_url") or 
-                    status_data.get("data", {}).get("url") or 
-                    status_data.get("data", {}).get("video")
-                )
-                if video_url:
-                    return video_url
+            if data.get("code") == 0:
+                task_id = data.get("data", {}).get("id")
+                if task_id:
+                    return f"✅ 视频任务已提交！任务ID: `{task_id}`\n请等待2-5分钟后查看结果。"
                 else:
-                    return f"Task completed but no video URL found: {json.dumps(status_data, ensure_ascii=False)[:300]}"
-            elif task_status in ["failed", "error"]:
-                err_msg = status_data.get("data", {}).get("message") or status_data.get("message") or "Unknown error"
-                return f"Video generation failed: {err_msg}"
-            elif task_status in ["submitted", "processing"]:
-                continue
-        
-        return "Video generation timeout (took more than 5 minutes)"
+                    return f"提交成功但未返回任务ID: {json.dumps(data, ensure_ascii=False)}"
+            else:
+                return f"提交失败: {data.get('message', 'Unknown error')}"
         
     except json.JSONDecodeError as e:
-        return f"JSON decode error: {str(e)}. Raw response: {raw_text[:200] if 'raw_text' in locals() else 'N/A'}"
+        return f"JSON解析错误: {str(e)}"
     except Exception as e:
-        return f"Video generation failed: {str(e)}"
+        return f"视频生成失败: {str(e)}"
 
 
 async def send_image_result(msg, result: str, original_prompt: str = ""):
@@ -469,14 +369,7 @@ async def stream_reply(msg, messages, model, image_base64: str = None):
         else:
             result = await generate_video_text_only(prompt)
 
-        if result.startswith("http"):
-            try:
-                await msg.reply_video(result, caption=prompt[:200] if prompt else None)
-                await msg.edit_text("🎬 视频已生成！")
-            except Exception:
-                await msg.edit_text(f"生成的视频：{result}")
-        else:
-            await msg.edit_text(f"❌ {result}")
+        await msg.edit_text(result)
         return "video_generated"
 
     # ===== 图片生成/编辑 =====
@@ -550,8 +443,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines.append("  • `NB 画一只猫` → 生成新图片")
     lines.append("")
     lines.append("**🎬 视频操作：**")
-    lines.append("  • 发图片 + `SP 让它挥手` → 图生视频")
-    lines.append("  • `SP 生成3秒视频` → 文生视频")
+    lines.append("  • 发图片 + `SP 让它挥手` → 图生视频（提交任务）")
+    lines.append("  • `SP 生成3秒视频` → 文生视频（提交任务）")
     lines.append("")
     lines.append("**💬 聊天：**")
     lines.append("  • `A 解释量子计算` → AI 回答")
