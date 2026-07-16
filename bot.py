@@ -251,19 +251,37 @@ async def generate_video_with_image(prompt: str, image_base64: str) -> str:
         async with httpx.AsyncClient(timeout=300.0) as http:
             resp = await http.post(gen_url, json=payload, headers=headers)
             data = resp.json()
+        
+        # 🔥 打印完整响应，方便调试
+        log.info(f"Video API response: {json.dumps(data, ensure_ascii=False)[:500]}")
+        
         if resp.status_code != 200:
             return f"Video generation error: {data.get('error', {}).get('message', resp.text)}"
+        
+        # 如果返回的是任务ID，需要轮询
+        if "data" in data and "task_id" in data["data"]:
+            task_id = data["data"]["task_id"]
+            return f"Task submitted: {task_id}. Please wait for completion."
+        
+        # 兼容不同返回格式
         if "data" in data and len(data["data"]) > 0:
-            item = data["data"][0]
+            item = data["data"][0] if isinstance(data["data"], list) else data["data"]
             if "url" in item and item["url"]:
                 return item["url"]
-            if "video_url" in item:
+            if "video_url" in item and item["video_url"]:
                 return item["video_url"]
+            if "video" in item and item["video"]:
+                return item["video"]
         if "url" in data:
             return data["url"]
         if "video_url" in data:
             return data["video_url"]
-        return f"Unexpected response: {json.dumps(data)[:200]}"
+        if "video" in data:
+            return data["video"]
+        if "result" in data:
+            return str(data["result"])
+        
+        return f"Unexpected response: {json.dumps(data, ensure_ascii=False)[:500]}"
     except Exception as e:
         return f"Video generation failed: {str(e)}"
 
@@ -288,19 +306,34 @@ async def generate_video_text_only(prompt: str) -> str:
         async with httpx.AsyncClient(timeout=300.0) as http:
             resp = await http.post(gen_url, json=payload, headers=headers)
             data = resp.json()
+        
+        log.info(f"Video text API response: {json.dumps(data, ensure_ascii=False)[:500]}")
+        
         if resp.status_code != 200:
             return f"Video generation error: {data.get('error', {}).get('message', resp.text)}"
+        
+        if "data" in data and "task_id" in data["data"]:
+            task_id = data["data"]["task_id"]
+            return f"Task submitted: {task_id}. Please wait for completion."
+        
         if "data" in data and len(data["data"]) > 0:
-            item = data["data"][0]
+            item = data["data"][0] if isinstance(data["data"], list) else data["data"]
             if "url" in item and item["url"]:
                 return item["url"]
-            if "video_url" in item:
+            if "video_url" in item and item["video_url"]:
                 return item["video_url"]
+            if "video" in item and item["video"]:
+                return item["video"]
         if "url" in data:
             return data["url"]
         if "video_url" in data:
             return data["video_url"]
-        return f"Unexpected response: {json.dumps(data)[:200]}"
+        if "video" in data:
+            return data["video"]
+        if "result" in data:
+            return str(data["result"])
+        
+        return f"Unexpected response: {json.dumps(data, ensure_ascii=False)[:500]}"
     except Exception as e:
         return f"Video generation failed: {str(e)}"
 
