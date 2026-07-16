@@ -233,12 +233,12 @@ async def generate_video_with_image(prompt: str, image_base64: str) -> str:
     payload = {
         "contents": [
             {
-                "type": "image",
-                "image": f"data:image/jpeg;base64,{image_base64}"
+                "type": "prompt",
+                "text": prompt
             },
             {
-                "type": "text",
-                "text": prompt
+                "type": "first_frame",
+                "image": f"data:image/jpeg;base64,{image_base64}"
             }
         ],
         "model": "kling-3.0-turbo"
@@ -274,7 +274,7 @@ async def generate_video_text_only(prompt: str) -> str:
     payload = {
         "contents": [
             {
-                "type": "text",
+                "type": "prompt",
                 "text": prompt
             }
         ],
