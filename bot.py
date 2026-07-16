@@ -193,7 +193,7 @@ async def generate_image(prompt: str) -> str:
 
 async def generate_video(prompt: str) -> str:
     """调用 /kling/image-to-video/kling-3.0-turbo 接口生成视频"""
-    gen_url = f"{BASE_URL}/kling/image-to-video/kling-3.0-turbo" 
+    gen_url = f"{BASE_URL}/kling/image-to-video/kling-3.0-turbo"
     payload = {
         "model": "kling-3.0-turbo",
         "prompt": prompt,
@@ -204,7 +204,7 @@ async def generate_video(prompt: str) -> str:
         "Content-Type": "application/json"
     }
     try:
-        async with httpx.AsyncClient(timeout=120.0) as http:
+        async with httpx.AsyncClient(timeout=300.0) as http:
             resp = await http.post(gen_url, json=payload, headers=headers)
             data = resp.json()
         if resp.status_code != 200:
