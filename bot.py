@@ -7,6 +7,7 @@ import time
 import base64
 import logging
 import json
+import asyncio  # 🔥 添加这一行
 import httpx
 from PIL import Image
 from dotenv import load_dotenv
