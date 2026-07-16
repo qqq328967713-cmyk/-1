@@ -152,6 +152,7 @@ async def send_long(msg, text):
 
 
 async def generate_image(prompt: str) -> str:
+    """文生图：只输入文字，生成新图片"""
     gen_url = f"{BASE_URL}/images/generations"
     payload = {
         "model": "gpt-image-2",
@@ -185,8 +186,79 @@ async def generate_image(prompt: str) -> str:
         return f"Image generation failed: {str(e)}"
 
 
-async def generate_video(prompt: str) -> str:
+async def generate_image_edit(prompt: str, image_base64: str) -> str:
+    """图生图：输入图片+文字，修改/修复图片"""
+    gen_url = f"{BASE_URL}/images/edits"
+    payload = {
+        "model": "gpt-image-2",
+        "prompt": prompt,
+        "image": f"data:image/png;base64,{image_base64}",
+        "n": 1
+    }
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json"
+    }
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as http:
+            resp = await http.post(gen_url, json=payload, headers=headers)
+            data = resp.json()
+        if resp.status_code != 200:
+            return f"Image edit error: {data.get('error', {}).get('message', resp.text)}"
+        if "data" in data and len(data["data"]) > 0:
+            item = data["data"][0]
+            if "url" in item and item["url"]:
+                return item["url"]
+            if "b64_json" in item and item["b64_json"]:
+                return f"data:image/png;base64,{item['b64_json']}"
+        if "url" in data:
+            return data["url"]
+        if "output" in data:
+            output = data["output"][0] if isinstance(data["output"], list) else data["output"]
+            if isinstance(output, str) and (output.startswith("http") or output.startswith("data:")):
+                return output
+        return f"Unexpected response: {json.dumps(data)[:200]}"
+    except Exception as e:
+        return f"Image edit failed: {str(e)}"
+
+
+async def generate_video_with_image(prompt: str, image_base64: str) -> str:
+    """图生视频：输入图片+文字，生成视频"""
     gen_url = "https://yunwu.ai/kling/image-to-video/kling-3.0-turbo"
+    payload = {
+        "model": "kling-3.0-turbo",
+        "prompt": prompt,
+        "image": f"data:image/jpeg;base64,{image_base64}",
+        "duration": 3
+    }
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json"
+    }
+    try:
+        async with httpx.AsyncClient(timeout=300.0) as http:
+            resp = await http.post(gen_url, json=payload, headers=headers)
+            data = resp.json()
+        if resp.status_code != 200:
+            return f"Video generation error: {data.get('error', {}).get('message', resp.text)}"
+        if "data" in data and len(data["data"]) > 0:
+            item = data["data"][0]
+            if "url" in item and item["url"]:
+                return item["url"]
+            if "video_url" in item:
+                return item["video_url"]
+        if "url" in data:
+            return data["url"]
+        if "video_url" in data:
+            return data["video_url"]
+        return f"Unexpected response: {json.dumps(data)[:200]}"
+    except Exception as e:
+        return f"Video generation failed: {str(e)}"
+
+
+async def generate_video_text_only(prompt: str) -> str:
+    """文生视频：只输入文字，生成视频"""
+    gen_url = "https://yunwu.ai/kling/text-to-video/kling-3.0-turbo"
     payload = {
         "model": "kling-3.0-turbo",
         "prompt": prompt,
@@ -221,7 +293,7 @@ async def send_image_result(msg, result: str, original_prompt: str = ""):
     if result.startswith("http") or result.startswith("data:image"):
         try:
             await msg.reply_photo(result, caption=original_prompt[:200] if original_prompt else None)
-            await msg.edit_text("✅ 绘图已完成")
+            await msg.edit_text("✅ 图片已完成")
             return True
         except Exception as e:
             log.error("发送图片失败: %s", e)
@@ -230,7 +302,7 @@ async def send_image_result(msg, result: str, original_prompt: str = ""):
                     base64_data = result.split(",")[1] if "," in result else result
                     image_bytes = base64.b64decode(base64_data)
                     await msg.reply_photo(InputFile(io.BytesIO(image_bytes), filename="image.png"))
-                    await msg.edit_text("✅ 绘图已完成")
+                    await msg.edit_text("✅ 图片已完成")
                     return True
                 except Exception as e2:
                     log.error("base64 发送失败: %s", e2)
@@ -245,7 +317,7 @@ def get_model_type(model_id: str) -> str:
     return "chat"
 
 
-async def stream_reply(msg, messages, model):
+async def stream_reply(msg, messages, model, image_base64: str = None):
     full = ""
     last_len = 0
     last_t = time.time()
@@ -265,13 +337,19 @@ async def stream_reply(msg, messages, model):
 
     model_type = get_model_type(model)
 
+    # ===== 视频生成 =====
     if model_type == "video":
         prompt = user_content
-        for prefix in ["视频", "生成", "拍", "录"]:
+        for prefix in ["视频", "生成", "拍", "录", "SP"]:
             prompt = prompt.replace(prefix, "").strip()
         if not prompt:
             prompt = user_content
-        result = await generate_video(prompt)
+
+        if image_base64:
+            result = await generate_video_with_image(prompt, image_base64)
+        else:
+            result = await generate_video_text_only(prompt)
+
         if result.startswith("http"):
             try:
                 await msg.reply_video(result, caption=prompt[:200] if prompt else None)
@@ -282,16 +360,25 @@ async def stream_reply(msg, messages, model):
             await msg.edit_text(f"❌ {result}")
         return "video_generated"
 
+    # ===== 图片生成/编辑 =====
     if model_type == "image":
         prompt = user_content
-        for prefix in ["画", "生成", "图片", "照片", "图", "绘"]:
+        for prefix in ["画", "生成", "图片", "照片", "图", "绘", "NB"]:
             prompt = prompt.replace(prefix, "").strip()
         if not prompt:
             prompt = user_content
-        result = await generate_image(prompt)
+
+        # 🔥 如果有图片，走图生图（修改/修复）
+        if image_base64:
+            result = await generate_image_edit(prompt, image_base64)
+        else:
+            # 没有图片，走文生图
+            result = await generate_image(prompt)
+
         await send_image_result(msg, result, prompt)
         return "image_generated"
 
+    # ===== 文本聊天 =====
     try:
         stream = await client.chat.completions.create(
             model=model, messages=messages, stream=True,
@@ -331,15 +418,31 @@ async def stream_reply(msg, messages, model):
 # 命令处理器
 # ============================================
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    lines = ["**可用模型：**"]
+    lines = [
+        "**🤖 多模型 Bot**",
+        "",
+        "**可用模型：**",
+    ]
     for prefix, info in MODEL_MAP.items():
         emoji = "🖼️" if info["type"] == "image" else "🎬" if info["type"] == "video" else "💬"
         lines.append(f"  • `{prefix}` → {emoji} {info['id']}")
     lines.append(f"  • (无前缀) → {DEFAULT_MODEL}")
-    lines.append("\n示例：")
-    lines.append("  `NB 画一只猫` → 生成图片")
-    lines.append("  `SP 生成3秒视频，一个人招手` → 生成视频")
-    lines.append("  `A 解释量子计算` → AI 回答")
+    lines.append("")
+    lines.append("**📷 图片操作：**")
+    lines.append("  • 发图片 + `NB 把猫变成白色` → 修改/修复图片")
+    lines.append("  • `NB 画一只猫` → 生成新图片")
+    lines.append("")
+    lines.append("**🎬 视频操作：**")
+    lines.append("  • 发图片 + `SP 让它挥手` → 图生视频")
+    lines.append("  • `SP 生成3秒视频` → 文生视频")
+    lines.append("")
+    lines.append("**💬 聊天：**")
+    lines.append("  • `A 解释量子计算` → AI 回答")
+    lines.append("  • `ZZ 写一段代码` → AI 编程")
+    lines.append("")
+    lines.append("**其他：**")
+    lines.append("  • `/clear` — 清空对话历史")
+
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
 
 
@@ -360,6 +463,21 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not raw_text:
         return
 
+    # 🔥 检测是否有图片附件
+    image_base64 = None
+    if update.message.photo:
+        photo_file = update.message.photo[-1]
+        try:
+            file = await ctx.bot.get_file(photo_file.file_id)
+            raw = await file.download_as_bytearray()
+            img = Image.open(io.BytesIO(raw))
+            img.thumbnail((1024, 1024))
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            image_base64 = base64.b64encode(buf.getvalue()).decode()
+        except Exception as e:
+            log.error("图片处理失败: %s", e)
+
     selected_model, clean_text = detect_model_from_text(raw_text)
     if selected_model is None:
         selected_model = DEFAULT_MODEL
@@ -379,7 +497,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + hist
 
     placeholder = await update.message.reply_text(f"⏳ 使用模型: {selected_model}")
-    reply = await stream_reply(placeholder, msgs, selected_model)
+    reply = await stream_reply(placeholder, msgs, selected_model, image_base64)
     if reply and reply not in ["image_generated", "video_generated"]:
         hist.append({"role": "assistant", "content": reply})
 
@@ -424,7 +542,7 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + hist + [vision_msg]
 
     placeholder = await update.message.reply_text(f"⏳ 分析图片中... (模型: {selected_model})")
-    reply = await stream_reply(placeholder, msgs, selected_model)
+    reply = await stream_reply(placeholder, msgs, selected_model, b64)
     if reply and reply not in ["image_generated", "video_generated"]:
         hist.append({"role": "user", "content": f"[photo] {clean_caption}"})
         hist.append({"role": "assistant", "content": reply})
