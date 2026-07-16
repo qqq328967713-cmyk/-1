@@ -264,13 +264,23 @@ async def generate_video_with_image(prompt: str, image_base64: str) -> str:
         return f"Video generation failed: {str(e)}"
 
 
-async def generate_video_text_only(prompt: str) -> str:
-    """文生视频：只输入文字，生成视频"""
-    gen_url = "https://yunwu.ai/kling/text-to-video/kling-3.0-turbo"
+async def generate_video_with_image(prompt: str, image_base64: str) -> str:
+    """图生视频：输入图片+文字，生成视频"""
+    gen_url = "https://yunwu.ai/kling/image-to-video/kling-3.0-turbo"
+    
+    # 云雾AI要求的格式：contents 是一个列表，包含图片和文字
     payload = {
-        "model": "kling-3.0-turbo",
-        "prompt": prompt,
-        "duration": 3
+        "contents": [
+            {
+                "type": "image",
+                "image": f"data:image/jpeg;base64,{image_base64}"
+            },
+            {
+                "type": "text",
+                "text": prompt
+            }
+        ],
+        "model": "kling-3.0-turbo"
     }
     headers = {
         "Authorization": f"Bearer {API_KEY}",
@@ -295,34 +305,6 @@ async def generate_video_text_only(prompt: str) -> str:
         return f"Unexpected response: {json.dumps(data)[:200]}"
     except Exception as e:
         return f"Video generation failed: {str(e)}"
-
-
-async def send_image_result(msg, result: str, original_prompt: str = ""):
-    if result.startswith("http") or result.startswith("data:image"):
-        try:
-            await msg.reply_photo(result, caption=original_prompt[:200] if original_prompt else None)
-            await msg.edit_text("✅ 图片已完成")
-            return True
-        except Exception as e:
-            log.error("发送图片失败: %s", e)
-            if result.startswith("data:image"):
-                try:
-                    base64_data = result.split(",")[1] if "," in result else result
-                    image_bytes = base64.b64decode(base64_data)
-                    await msg.reply_photo(InputFile(io.BytesIO(image_bytes), filename="image.png"))
-                    await msg.edit_text("✅ 图片已完成")
-                    return True
-                except Exception as e2:
-                    log.error("base64 发送失败: %s", e2)
-    await msg.edit_text(f"❌ {result}")
-    return False
-
-
-def get_model_type(model_id: str) -> str:
-    for prefix, info in MODEL_MAP.items():
-        if info["id"] == model_id:
-            return info["type"]
-    return "chat"
 
 
 async def stream_reply(msg, messages, model, image_base64: str = None):
