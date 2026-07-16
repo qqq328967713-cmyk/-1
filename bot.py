@@ -192,8 +192,8 @@ async def generate_image(prompt: str) -> str:
 
 
 async def generate_video(prompt: str) -> str:
-    """调用 /videos/generations 接口生成视频"""
-    gen_url = f"{BASE_URL}/videos/generations"
+    """调用 /kling/image-to-video/kling-3.0-turbo 接口生成视频"""
+    gen_url = f"{BASE_URL}/kling/image-to-video/kling-3.0-turbo" 
     payload = {
         "model": "kling-3.0-turbo",
         "prompt": prompt,
