@@ -22,7 +22,7 @@ load_dotenv()
 # ============================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 API_KEY = os.getenv("API_KEY", "")
-BASE_URL = os.getenv("BASE_URL", "https://api.tokenmix.ai/v1")
+BASE_URL = os.getenv("BASE_URL", "https://yunwu.ai/v1")
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))
 ALLOWED_USERS = os.getenv("ALLOWED_USERS", "")
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "You are a helpful assistant.")
@@ -79,14 +79,10 @@ def strip_mention(text: str) -> str:
 
 
 def detect_model_from_text(text: str) -> tuple:
-    """
-    检测文本中的指令前缀，返回 (模型ID, 去除前缀后的文本)
-    """
     text = text.strip()
     if not text:
         return None, text
 
-    # 先检查完整匹配（前缀+分隔符）
     for prefix, info in MODEL_MAP.items():
         model_id = info["id"]
         pattern = rf"^{re.escape(prefix)}[\s:：\n]+"
@@ -95,7 +91,6 @@ def detect_model_from_text(text: str) -> tuple:
             clean_text = text[match.end():].strip()
             return model_id, clean_text
 
-    # 再检查无分隔符的情况（如 "NB画一只猫"）
     for prefix, info in MODEL_MAP.items():
         model_id = info["id"]
         if text.lower().startswith(prefix.lower()):
@@ -157,7 +152,6 @@ async def send_long(msg, text):
 
 
 async def generate_image(prompt: str) -> str:
-    """调用 /images/generations 接口生成图片"""
     gen_url = f"{BASE_URL}/images/generations"
     payload = {
         "model": "gpt-image-2",
@@ -192,8 +186,7 @@ async def generate_image(prompt: str) -> str:
 
 
 async def generate_video(prompt: str) -> str:
-    """调用 /kling/image-to-video/kling-3.0-turbo 接口生成视频"""
-gen_url = "https://yunwu.ai/kling/image-to-video/kling-3.0-turbo"
+    gen_url = "https://yunwu.ai/kling/image-to-video/kling-3.0-turbo"
     payload = {
         "model": "kling-3.0-turbo",
         "prompt": prompt,
@@ -225,7 +218,6 @@ gen_url = "https://yunwu.ai/kling/image-to-video/kling-3.0-turbo"
 
 
 async def send_image_result(msg, result: str, original_prompt: str = ""):
-    """发送图片结果"""
     if result.startswith("http") or result.startswith("data:image"):
         try:
             await msg.reply_photo(result, caption=original_prompt[:200] if original_prompt else None)
@@ -247,7 +239,6 @@ async def send_image_result(msg, result: str, original_prompt: str = ""):
 
 
 def get_model_type(model_id: str) -> str:
-    """根据模型ID获取类型"""
     for prefix, info in MODEL_MAP.items():
         if info["id"] == model_id:
             return info["type"]
@@ -274,7 +265,6 @@ async def stream_reply(msg, messages, model):
 
     model_type = get_model_type(model)
 
-    # ===== 视频生成 =====
     if model_type == "video":
         prompt = user_content
         for prefix in ["视频", "生成", "拍", "录"]:
@@ -292,7 +282,6 @@ async def stream_reply(msg, messages, model):
             await msg.edit_text(f"❌ {result}")
         return "video_generated"
 
-    # ===== 图片生成 =====
     if model_type == "image":
         prompt = user_content
         for prefix in ["画", "生成", "图片", "照片", "图", "绘"]:
@@ -303,7 +292,6 @@ async def stream_reply(msg, messages, model):
         await send_image_result(msg, result, prompt)
         return "image_generated"
 
-    # ===== 文本聊天 =====
     try:
         stream = await client.chat.completions.create(
             model=model, messages=messages, stream=True,
@@ -350,7 +338,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines.append(f"  • (无前缀) → {DEFAULT_MODEL}")
     lines.append("\n示例：")
     lines.append("  `NB 画一只猫` → 生成图片")
-    lines.append("  `SP 生成3秒视频` → 生成视频")
+    lines.append("  `SP 生成3秒视频，一个人招手` → 生成视频")
     lines.append("  `A 解释量子计算` → AI 回答")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
 
