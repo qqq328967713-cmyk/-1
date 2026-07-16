@@ -238,7 +238,7 @@ async def generate_video_with_image(prompt: str, image_base64: str) -> str:
             },
             {
                 "type": "first_frame",
-                "image": f"data:image/jpeg;base64,{image_base64}"
+                "url": f"data:image/jpeg;base64,{image_base64}"
             }
         ],
         "model": "kling-3.0-turbo"
