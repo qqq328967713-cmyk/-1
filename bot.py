@@ -37,6 +37,8 @@ MODEL_MAP = {
     "A": {"id": "gemini-3.1-pro-preview", "type": "chat"},
     "ZZ": {"id": "claude-sonnet-5", "type": "chat"},
     "SP": {"id": "kling-3.0-turbo", "type": "video"},
+    "GK": {"id": "grok-3", "type": "chat"},
+    "GK3": {"id": "grok-3-turbo-20241224", "type": "chat"},
 }
 
 log = logging.getLogger(__name__)
